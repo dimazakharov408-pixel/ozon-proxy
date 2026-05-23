@@ -1,139 +1,79 @@
-const express = require('express');
-const cors = require('cors');
-const fetch = (...args) => import('node-fetch').then(({default: f}) => f(...args));
+import express from "express";
+import cors from "cors";
+import fetch from "node-fetch";
 
 const app = express();
+const PORT = process.env.PORT || 3000;
+const OZON_API = "https://api-seller.ozon.ru";
+
 app.use(cors());
-app.use(express.json());
+app.use(express.json({ limit: "2mb" }));
 
-const BASE = 'https://api-seller.ozon.ru';
-
-async function ozonPost(endpoint, body, clientId, apiKey) {
-  const r = await fetch(`${BASE}${endpoint}`, {
-    method: 'POST',
-    headers: {
-      'Client-Id': String(clientId),
-      'Api-Key': String(apiKey),
-      'Content-Type': 'application/json',
-    },
-    body: JSON.stringify(body),
+app.get("/", (req, res) => {
+  res.json({
+    ok: true,
+    service: "ozon-proxy",
+    endpoints: ["/health", "/api/ozon"]
   });
-  const text = await r.text();
-  try { return JSON.parse(text); } catch(e) { return { error: text }; }
-}
-
-// Текущий месяц с 1-го числа до сегодня
-function getCurrentMonthRange() {
-  const now = new Date();
-  const pad = n => String(n).padStart(2,'0');
-  const fmtDate = d => `${d.getFullYear()}-${pad(d.getMonth()+1)}-${pad(d.getDate())}`;
-  const fmtTime = d => `${fmtDate(d)}T00:00:00.000Z`;
-  const firstDay = new Date(now.getFullYear(), now.getMonth(), 1);
-  return {
-    from: fmtTime(firstDay),
-    to: fmtTime(now),
-    fromDate: fmtDate(firstDay),
-    toDate: fmtDate(now),
-  };
-}
-
-// Произвольный период (дни назад)
-function getDateRange(days) {
-  const to = new Date(), from = new Date();
-  from.setDate(from.getDate() - Number(days));
-  const pad = n => String(n).padStart(2,'0');
-  const fmtDate = d => `${d.getFullYear()}-${pad(d.getMonth()+1)}-${pad(d.getDate())}`;
-  const fmtTime = d => `${fmtDate(d)}T00:00:00.000Z`;
-  return { from: fmtTime(from), to: fmtTime(to), fromDate: fmtDate(from), toDate: fmtDate(to) };
-}
-
-async function fetchAllTransactions(from, to, clientId, apiKey) {
-  const allOps = [];
-  let page = 1;
-  while (true) {
-    const res = await ozonPost('/v3/finance/transaction/list', {
-      filter: { date: { from, to }, transaction_type: 'all' },
-      page, page_size: 1000,
-    }, clientId, apiKey);
-    const ops = res?.result?.operations || [];
-    allOps.push(...ops);
-    const pageCount = res?.result?.page_count || 1;
-    if (page >= pageCount) break;
-    page++;
-  }
-  return allOps;
-}
-
-app.get('/test', async (req, res) => {
-  const { clientId, apiKey, days = 30 } = req.query;
-  if (!clientId || !apiKey) return res.status(400).json({ error: 'Missing params' });
-  const { fromDate, toDate } = getDateRange(days);
-  const result = await ozonPost('/v1/analytics/data', {
-    date_from: fromDate, date_to: toDate,
-    dimension: ['sku', 'item'],
-    metrics: ['revenue', 'ordered_units'],
-    limit: 100, offset: 0,
-  }, clientId, apiKey);
-  res.json({ status: 200, data: result });
 });
 
-app.get('/dashboard', async (req, res) => {
-  const { clientId, apiKey, period } = req.query;
-  if (!clientId || !apiKey) return res.status(400).json({ error: 'Missing params' });
+app.get("/health", (req, res) => {
+  res.json({ ok: true, time: new Date().toISOString() });
+});
 
-  // period=month → с 1-го числа, period=N → последние N дней
-  let range;
-  if (!period || period === 'month') {
-    range = getCurrentMonthRange();
-  } else {
-    range = getDateRange(Number(period));
-  }
-
-  const { from, to, fromDate, toDate } = range;
-
+app.post("/api/ozon", async (req, res) => {
   try {
-    const [analyticsRaw, allOps] = await Promise.all([
-      ozonPost('/v1/analytics/data', {
-        date_from: fromDate, date_to: toDate,
-        dimension: ['sku', 'item'],
-        metrics: ['revenue', 'ordered_units'],
-        limit: 100, offset: 0,
-      }, clientId, apiKey),
-      fetchAllTransactions(from, to, clientId, apiKey)
-    ]);
+    const { endpoint, body, clientId, apiKey } = req.body || {};
 
-    // Точный нетто = сумма ВСЕХ операций за период
-    let totalNetto = 0;
-    const expenseMap = {};
-
-    for (const op of allOps) {
-      const amount = parseFloat(op.amount) || 0;
-      totalNetto += amount;
-      if (amount < 0) {
-        const type = op.operation_type_name || 'Прочее';
-        expenseMap[type] = (expenseMap[type] || 0) + amount;
-      }
+    if (!endpoint || !clientId || !apiKey) {
+      return res.status(400).json({
+        error: "Нужны endpoint, clientId и apiKey"
+      });
     }
 
-    totalNetto = Math.round(totalNetto * 100) / 100;
+    if (!endpoint.startsWith("/")) {
+      return res.status(400).json({
+        error: "endpoint должен начинаться с /"
+      });
+    }
 
-    // Выручка из аналитики
-    const analyticsRows = analyticsRaw?.result?.data || [];
-    const totalRevenue = analyticsRows.reduce((s, r) => s + (r.metrics?.[0] || 0), 0);
-
-    res.json({
-      analytics: analyticsRaw,
-      netto: totalNetto,
-      expenses: expenseMap,
-      period: { from: fromDate, to: toDate },
-      operations_count: allOps.length,
+    const ozonRes = await fetch(`${OZON_API}${endpoint}`, {
+      method: "POST",
+      headers: {
+        "Client-Id": String(clientId),
+        "Api-Key": String(apiKey),
+        "Content-Type": "application/json"
+      },
+      body: JSON.stringify(body || {})
     });
+
+    const text = await ozonRes.text();
+
+    let data;
+    try {
+      data = text ? JSON.parse(text) : {};
+    } catch {
+      data = { raw: text };
+    }
+
+    if (!ozonRes.ok) {
+      return res.status(ozonRes.status).json({
+        error: "Ozon API error",
+        status: ozonRes.status,
+        details: data
+      });
+    }
+
+    res.json(data);
   } catch (err) {
-    res.status(500).json({ error: err.message });
+    console.error("Proxy error:", err);
+    res.status(500).json({
+      error: "Proxy server error",
+      message: err.message
+    });
   }
 });
 
-app.get('/health', (_, res) => res.json({ ok: true }));
-
-const PORT = process.env.PORT || 3000;
-app.listen(PORT, () => console.log(`Proxy running on port ${PORT}`));
+app.listen(PORT, () => {
+  console.log(`Ozon proxy started on port ${PORT}`);
+});
