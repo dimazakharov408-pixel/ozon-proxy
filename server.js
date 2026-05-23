@@ -24,62 +24,41 @@ async function ozonPost(endpoint, body, clientId, apiKey) {
 }
 
 function getDateRange(days) {
-  const to = new Date();
-  const from = new Date();
-  from.setDate(from.getDate() - days);
+  const to = new Date(), from = new Date();
+  from.setDate(from.getDate() - Number(days));
   const pad = n => String(n).padStart(2,'0');
   const fmtDate = d => `${d.getFullYear()}-${pad(d.getMonth()+1)}-${pad(d.getDate())}`;
   const fmtTime = d => `${fmtDate(d)}T00:00:00.000Z`;
   return { from: fmtTime(from), to: fmtTime(to), fromDate: fmtDate(from), toDate: fmtDate(to) };
 }
 
-// GET test — keys in URL params for easy browser testing
+// Analytics — GET
 app.get('/test', async (req, res) => {
-  const { clientId, apiKey } = req.query;
-  if (!clientId || !apiKey) {
-    return res.status(400).json({ error: 'Add ?clientId=XXX&apiKey=YYY to URL' });
-  }
-  const { fromDate, toDate } = getDateRange(30);
+  const { clientId, apiKey, days = 30 } = req.query;
+  if (!clientId || !apiKey) return res.status(400).json({ error: 'Add ?clientId=XXX&apiKey=YYY' });
+  const { fromDate, toDate } = getDateRange(days);
   const result = await ozonPost('/v1/analytics/data', {
     date_from: fromDate,
     date_to: toDate,
     dimension: ['sku', 'item'],
     metrics: ['revenue', 'ordered_units'],
-    limit: 10,
+    limit: 100,
     offset: 0,
   }, clientId, apiKey);
   res.json(result);
 });
 
-// POST dashboard — used by the app
-app.post('/dashboard', async (req, res) => {
-  const { clientId, apiKey, days = 30 } = req.body;
-  if (!clientId || !apiKey) return res.status(400).json({ error: 'Missing clientId or apiKey' });
-
-  const { from, to, fromDate, toDate } = getDateRange(Number(days));
-
-  try {
-    const [analytics, transactions] = await Promise.all([
-      ozonPost('/v1/analytics/data', {
-        date_from: fromDate,
-        date_to: toDate,
-        dimension: ['sku', 'item'],
-        metrics: ['revenue', 'ordered_units'],
-        limit: 100,
-        offset: 0,
-      }, clientId, apiKey),
-
-      ozonPost('/v3/finance/transaction/list', {
-        filter: { date: { from, to }, transaction_type: 'all' },
-        page: 1,
-        page_size: 500,
-      }, clientId, apiKey),
-    ]);
-
-    res.json({ analytics: analytics.data, transactions: transactions.data });
-  } catch (err) {
-    res.status(500).json({ error: err.message });
-  }
+// Transactions — GET
+app.get('/transactions', async (req, res) => {
+  const { clientId, apiKey, days = 30 } = req.query;
+  if (!clientId || !apiKey) return res.status(400).json({ error: 'Add ?clientId=XXX&apiKey=YYY' });
+  const { from, to } = getDateRange(days);
+  const result = await ozonPost('/v3/finance/transaction/list', {
+    filter: { date: { from, to }, transaction_type: 'all' },
+    page: 1,
+    page_size: 1000,
+  }, clientId, apiKey);
+  res.json(result);
 });
 
 app.get('/health', (_, res) => res.json({ ok: true }));
