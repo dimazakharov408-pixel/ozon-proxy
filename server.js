@@ -22,6 +22,22 @@ async function ozonPost(endpoint, body, clientId, apiKey) {
   try { return JSON.parse(text); } catch(e) { return { error: text }; }
 }
 
+// Текущий месяц с 1-го числа до сегодня
+function getCurrentMonthRange() {
+  const now = new Date();
+  const pad = n => String(n).padStart(2,'0');
+  const fmtDate = d => `${d.getFullYear()}-${pad(d.getMonth()+1)}-${pad(d.getDate())}`;
+  const fmtTime = d => `${fmtDate(d)}T00:00:00.000Z`;
+  const firstDay = new Date(now.getFullYear(), now.getMonth(), 1);
+  return {
+    from: fmtTime(firstDay),
+    to: fmtTime(now),
+    fromDate: fmtDate(firstDay),
+    toDate: fmtDate(now),
+  };
+}
+
+// Произвольный период (дни назад)
 function getDateRange(days) {
   const to = new Date(), from = new Date();
   from.setDate(from.getDate() - Number(days));
@@ -62,11 +78,18 @@ app.get('/test', async (req, res) => {
 });
 
 app.get('/dashboard', async (req, res) => {
-  const { clientId, apiKey, days = 30 } = req.query;
+  const { clientId, apiKey, period } = req.query;
   if (!clientId || !apiKey) return res.status(400).json({ error: 'Missing params' });
 
-  const d = Number(days);
-  const { from, to, fromDate, toDate } = getDateRange(d);
+  // period=month → с 1-го числа, period=N → последние N дней
+  let range;
+  if (!period || period === 'month') {
+    range = getCurrentMonthRange();
+  } else {
+    range = getDateRange(Number(period));
+  }
+
+  const { from, to, fromDate, toDate } = range;
 
   try {
     const [analyticsRaw, allOps] = await Promise.all([
@@ -79,59 +102,31 @@ app.get('/dashboard', async (req, res) => {
       fetchAllTransactions(from, to, clientId, apiKey)
     ]);
 
-    // Выручка из аналитики
-    const analyticsRows = analyticsRaw?.result?.data || [];
-    const totalRevenue = analyticsRows.reduce((s, r) => s + (r.metrics?.[0] || 0), 0);
-
-    // Из транзакций считаем каждую статью расходов отдельно
+    // Точный нетто = сумма ВСЕХ операций за период
+    let totalNetto = 0;
     const expenseMap = {};
-    let txRevenue = 0;     // выручка из транзакций
-    let txCompensation = 0; // компенсации (баллы, программы партнёров)
 
     for (const op of allOps) {
       const amount = parseFloat(op.amount) || 0;
-      const type = op.operation_type_name || 'Прочее';
-
-      if (amount > 0) {
-        // Доходы: выручка от продаж и компенсации
-        if (op.operation_type === 'OperationAgentDeliveredToCustomer' ||
-            op.operation_type === 'ClientReturnAgentOperation') {
-          txRevenue += amount;
-        } else {
-          txCompensation += amount; // баллы, программы партнёров
-        }
-      } else if (amount < 0) {
+      totalNetto += amount;
+      if (amount < 0) {
+        const type = op.operation_type_name || 'Прочее';
         expenseMap[type] = (expenseMap[type] || 0) + amount;
       }
     }
 
-    const totalExpenses = Object.values(expenseMap).reduce((s, v) => s + v, 0);
+    totalNetto = Math.round(totalNetto * 100) / 100;
 
-    // Нетто из транзакций = выручка + компенсации + расходы
-    const nettoFromTx = txRevenue + txCompensation + totalExpenses;
-
-    // Проверяем: если нетто из транзакций разумное (30-90% от аналитической выручки)
-    // используем его, иначе считаем по проценту 76.72% из реального отчёта
-    const ratio = totalRevenue > 0 ? nettoFromTx / totalRevenue : 0;
-    const nettoIsValid = ratio > 0.3 && ratio < 1.2;
-
-    const finalNetto = nettoIsValid
-      ? nettoFromTx
-      : totalRevenue * 0.7672; // 76.72% — точный процент из майского отчёта
+    // Выручка из аналитики
+    const analyticsRows = analyticsRaw?.result?.data || [];
+    const totalRevenue = analyticsRows.reduce((s, r) => s + (r.metrics?.[0] || 0), 0);
 
     res.json({
       analytics: analyticsRaw,
-      netto: Math.round(finalNetto),
+      netto: totalNetto,
       expenses: expenseMap,
-      debug: {
-        tx_revenue: Math.round(txRevenue),
-        tx_compensation: Math.round(txCompensation),
-        tx_expenses: Math.round(totalExpenses),
-        netto_from_tx: Math.round(nettoFromTx),
-        netto_ratio: ratio.toFixed(3),
-        netto_source: nettoIsValid ? 'transactions' : 'percentage_76.72%',
-        operations_count: allOps.length,
-      }
+      period: { from: fromDate, to: toDate },
+      operations_count: allOps.length,
     });
   } catch (err) {
     res.status(500).json({ error: err.message });
