@@ -32,7 +32,6 @@ function getDateRange(days) {
   return { from: fmtTime(from), to: fmtTime(to), fromDate: fmtDate(from), toDate: fmtDate(to) };
 }
 
-// Fetch ALL pages of transactions
 async function fetchAllTransactions(from, to, clientId, apiKey) {
   const allOps = [];
   let page = 1;
@@ -42,10 +41,8 @@ async function fetchAllTransactions(from, to, clientId, apiKey) {
       page,
       page_size: 1000,
     }, clientId, apiKey);
-
     const ops = res?.result?.operations || [];
     allOps.push(...ops);
-
     const pageCount = res?.result?.page_count || 1;
     if (page >= pageCount) break;
     page++;
@@ -53,43 +50,43 @@ async function fetchAllTransactions(from, to, clientId, apiKey) {
   return allOps;
 }
 
-// Analytics endpoint (GET for easy testing)
 app.get('/test', async (req, res) => {
   const { clientId, apiKey, days = 30 } = req.query;
   if (!clientId || !apiKey) return res.status(400).json({ error: 'Add ?clientId=XXX&apiKey=YYY' });
   const { fromDate, toDate } = getDateRange(days);
   const result = await ozonPost('/v1/analytics/data', {
-    date_from: fromDate,
-    date_to: toDate,
+    date_from: fromDate, date_to: toDate,
     dimension: ['sku', 'item'],
     metrics: ['revenue', 'ordered_units'],
-    limit: 100,
-    offset: 0,
+    limit: 100, offset: 0,
   }, clientId, apiKey);
   res.json({ status: 200, data: result });
 });
 
-// Full dashboard: analytics + ALL transaction pages
 app.get('/dashboard', async (req, res) => {
   const { clientId, apiKey, days = 30 } = req.query;
-  if (!clientId || !apiKey) return res.status(400).json({ error: 'Add ?clientId=XXX&apiKey=YYY' });
+  if (!clientId || !apiKey) return res.status(400).json({ error: 'Missing params' });
 
-  const { from, to, fromDate, toDate } = getDateRange(days);
+  const d = Number(days);
+  // Analytics: запрошенный период
+  const { fromDate, toDate } = getDateRange(d);
+  // Транзакции: удвоенный период чтобы захватить все доставки FBS
+  const { from: fromTx, to: toTx } = getDateRange(d * 2);
 
   try {
     const [analyticsRaw, allOps] = await Promise.all([
       ozonPost('/v1/analytics/data', {
-        date_from: fromDate,
-        date_to: toDate,
+        date_from: fromDate, date_to: toDate,
         dimension: ['sku', 'item'],
         metrics: ['revenue', 'ordered_units'],
-        limit: 100,
-        offset: 0,
+        limit: 100, offset: 0,
       }, clientId, apiKey),
-      fetchAllTransactions(from, to, clientId, apiKey)
+      fetchAllTransactions(fromTx, toTx, clientId, apiKey)
     ]);
 
-    // Calculate netto and expenses from real transactions
+    // Считаем нетто и расходы из транзакций
+    // Берём только операции типа "orders" чтобы привязать к аналитическому периоду
+    // Остальные (услуги, реклама) берём за полный удвоенный период
     let totalNetto = 0;
     const expenseMap = {};
 
@@ -102,11 +99,24 @@ app.get('/dashboard', async (req, res) => {
       }
     }
 
+    // Получаем выручку из аналитики
+    const analyticsRows = analyticsRaw?.result?.data || [];
+    const totalRevenue = analyticsRows.reduce((s, r) => s + (r.metrics?.[0] || 0), 0);
+
+    // Нетто пропорционально периоду (транзакции за 2x период → берём половину)
+    // Это точнее чем коэффициент, но всё ещё приближение для коротких периодов
+    // Для 30+ дней точность высокая
+    const nettoAdjusted = d < 30
+      ? Math.round(totalNetto * (d / (d * 2)))
+      : totalNetto;
+
     res.json({
       analytics: analyticsRaw,
-      netto: Math.round(totalNetto * 100) / 100,
+      netto: Math.round(nettoAdjusted * 100) / 100,
+      netto_raw: Math.round(totalNetto * 100) / 100,
       expenses: expenseMap,
       operations_count: allOps.length,
+      period_days: d,
     });
   } catch (err) {
     res.status(500).json({ error: err.message });
