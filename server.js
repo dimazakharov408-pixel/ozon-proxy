@@ -19,8 +19,8 @@ async function ozonPost(endpoint, body, clientId, apiKey) {
     body: JSON.stringify(body),
   });
   const text = await r.text();
-  try { return { status: r.status, data: JSON.parse(text) }; }
-  catch(e) { return { status: r.status, data: text }; }
+  try { return JSON.parse(text); }
+  catch(e) { return { error: text }; }
 }
 
 function getDateRange(days) {
@@ -32,7 +32,28 @@ function getDateRange(days) {
   return { from: fmtTime(from), to: fmtTime(to), fromDate: fmtDate(from), toDate: fmtDate(to) };
 }
 
-// Analytics — GET
+// Fetch ALL pages of transactions
+async function fetchAllTransactions(from, to, clientId, apiKey) {
+  const allOps = [];
+  let page = 1;
+  while (true) {
+    const res = await ozonPost('/v3/finance/transaction/list', {
+      filter: { date: { from, to }, transaction_type: 'all' },
+      page,
+      page_size: 1000,
+    }, clientId, apiKey);
+
+    const ops = res?.result?.operations || [];
+    allOps.push(...ops);
+
+    const pageCount = res?.result?.page_count || 1;
+    if (page >= pageCount) break;
+    page++;
+  }
+  return allOps;
+}
+
+// Analytics endpoint (GET for easy testing)
 app.get('/test', async (req, res) => {
   const { clientId, apiKey, days = 30 } = req.query;
   if (!clientId || !apiKey) return res.status(400).json({ error: 'Add ?clientId=XXX&apiKey=YYY' });
@@ -45,20 +66,51 @@ app.get('/test', async (req, res) => {
     limit: 100,
     offset: 0,
   }, clientId, apiKey);
-  res.json(result);
+  res.json({ status: 200, data: result });
 });
 
-// Transactions — GET
-app.get('/transactions', async (req, res) => {
+// Full dashboard: analytics + ALL transaction pages
+app.get('/dashboard', async (req, res) => {
   const { clientId, apiKey, days = 30 } = req.query;
   if (!clientId || !apiKey) return res.status(400).json({ error: 'Add ?clientId=XXX&apiKey=YYY' });
-  const { from, to } = getDateRange(days);
-  const result = await ozonPost('/v3/finance/transaction/list', {
-    filter: { date: { from, to }, transaction_type: 'all' },
-    page: 1,
-    page_size: 1000,
-  }, clientId, apiKey);
-  res.json(result);
+
+  const { from, to, fromDate, toDate } = getDateRange(days);
+
+  try {
+    const [analyticsRaw, allOps] = await Promise.all([
+      ozonPost('/v1/analytics/data', {
+        date_from: fromDate,
+        date_to: toDate,
+        dimension: ['sku', 'item'],
+        metrics: ['revenue', 'ordered_units'],
+        limit: 100,
+        offset: 0,
+      }, clientId, apiKey),
+      fetchAllTransactions(from, to, clientId, apiKey)
+    ]);
+
+    // Calculate netto and expenses from real transactions
+    let totalNetto = 0;
+    const expenseMap = {};
+
+    for (const op of allOps) {
+      const amount = parseFloat(op.amount) || 0;
+      totalNetto += amount;
+      if (amount < 0) {
+        const type = op.operation_type_name || 'Прочее';
+        expenseMap[type] = (expenseMap[type] || 0) + amount;
+      }
+    }
+
+    res.json({
+      analytics: analyticsRaw,
+      netto: Math.round(totalNetto * 100) / 100,
+      expenses: expenseMap,
+      operations_count: allOps.length,
+    });
+  } catch (err) {
+    res.status(500).json({ error: err.message });
+  }
 });
 
 app.get('/health', (_, res) => res.json({ ok: true }));
