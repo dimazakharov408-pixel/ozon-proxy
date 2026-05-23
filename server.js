@@ -19,9 +19,8 @@ async function ozonPost(endpoint, body, clientId, apiKey) {
     body: JSON.stringify(body),
   });
   const text = await r.text();
-  let json;
-  try { json = JSON.parse(text); } catch(e) { json = { raw: text }; }
-  return { status: r.status, data: json };
+  try { return { status: r.status, data: JSON.parse(text) }; }
+  catch(e) { return { status: r.status, data: text }; }
 }
 
 function getDateRange(days) {
@@ -29,69 +28,58 @@ function getDateRange(days) {
   const from = new Date();
   from.setDate(from.getDate() - days);
   const pad = n => String(n).padStart(2,'0');
-  const fmt = d => `${d.getFullYear()}-${pad(d.getMonth()+1)}-${pad(d.getDate())}T00:00:00.000Z`;
   const fmtDate = d => `${d.getFullYear()}-${pad(d.getMonth()+1)}-${pad(d.getDate())}`;
-  return { from: fmt(from), to: fmt(to), fromDate: fmtDate(from), toDate: fmtDate(to) };
+  const fmtTime = d => `${fmtDate(d)}T00:00:00.000Z`;
+  return { from: fmtTime(from), to: fmtTime(to), fromDate: fmtDate(from), toDate: fmtDate(to) };
 }
 
+// GET test — keys in URL params for easy browser testing
+app.get('/test', async (req, res) => {
+  const { clientId, apiKey } = req.query;
+  if (!clientId || !apiKey) {
+    return res.status(400).json({ error: 'Add ?clientId=XXX&apiKey=YYY to URL' });
+  }
+  const { fromDate, toDate } = getDateRange(30);
+  const result = await ozonPost('/v1/analytics/data', {
+    date_from: fromDate,
+    date_to: toDate,
+    dimension: ['sku', 'item'],
+    metrics: ['revenue', 'ordered_units'],
+    limit: 10,
+    offset: 0,
+  }, clientId, apiKey);
+  res.json(result);
+});
+
+// POST dashboard — used by the app
 app.post('/dashboard', async (req, res) => {
   const { clientId, apiKey, days = 30 } = req.body;
   if (!clientId || !apiKey) return res.status(400).json({ error: 'Missing clientId or apiKey' });
 
   const { from, to, fromDate, toDate } = getDateRange(Number(days));
-  const debug = {};
 
   try {
-    // Analytics
-    const a = await ozonPost('/v1/analytics/data', {
-      date_from: fromDate,
-      date_to: toDate,
-      dimension: ['sku', 'item'],
-      metrics: ['revenue', 'ordered_units'],
-      limit: 100,
-      offset: 0,
-    }, clientId, apiKey);
-    debug.analytics = { status: a.status, data: a.data };
+    const [analytics, transactions] = await Promise.all([
+      ozonPost('/v1/analytics/data', {
+        date_from: fromDate,
+        date_to: toDate,
+        dimension: ['sku', 'item'],
+        metrics: ['revenue', 'ordered_units'],
+        limit: 100,
+        offset: 0,
+      }, clientId, apiKey),
 
-    // Transactions
-    const t = await ozonPost('/v3/finance/transaction/list', {
-      filter: { date: { from, to }, transaction_type: 'all' },
-      page: 1,
-      page_size: 500,
-    }, clientId, apiKey);
-    debug.transactions = { status: t.status, data: t.data };
+      ozonPost('/v3/finance/transaction/list', {
+        filter: { date: { from, to }, transaction_type: 'all' },
+        page: 1,
+        page_size: 500,
+      }, clientId, apiKey),
+    ]);
 
-    res.json({
-      ok: true,
-      debug,
-      analytics: a.data,
-      transactions: t.data,
-    });
+    res.json({ analytics: analytics.data, transactions: transactions.data });
   } catch (err) {
-    res.status(500).json({ error: err.message, debug });
+    res.status(500).json({ error: err.message });
   }
-});
-
-// Test endpoint — just check one simple call
-app.post('/test', async (req, res) => {
-  const { clientId, apiKey } = req.body;
-  if (!clientId || !apiKey) return res.status(400).json({ error: 'Missing clientId or apiKey' });
-
-  const today = new Date();
-  const from = new Date(); from.setDate(today.getDate() - 7);
-  const pad = n => String(n).padStart(2,'0');
-  const fmtDate = d => `${d.getFullYear()}-${pad(d.getMonth()+1)}-${pad(d.getDate())}`;
-
-  const result = await ozonPost('/v1/analytics/data', {
-    date_from: fmtDate(from),
-    date_to: fmtDate(today),
-    dimension: ['sku'],
-    metrics: ['revenue', 'ordered_units'],
-    limit: 10,
-    offset: 0,
-  }, clientId, apiKey);
-
-  res.json(result);
 });
 
 app.get('/health', (_, res) => res.json({ ok: true }));
