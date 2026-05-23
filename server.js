@@ -48,7 +48,7 @@ async function ozonPost(endpoint, body, clientId, apiKey) {
       data?.details?.message ||
       `Ozon API HTTP ${response.status}`;
 
-    const err = new Error(message);
+    const err = new Error(`${endpoint}: ${message}`);
     err.status = response.status;
     err.details = data;
     throw err;
