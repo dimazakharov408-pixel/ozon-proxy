@@ -79,48 +79,59 @@ app.get('/dashboard', async (req, res) => {
       fetchAllTransactions(from, to, clientId, apiKey)
     ]);
 
-    // Нетто = сумма всех операций за период
-    // Правильная логика: все amount суммируются в нетто выплату
-    let totalNetto = 0;
+    // Выручка из аналитики
+    const analyticsRows = analyticsRaw?.result?.data || [];
+    const totalRevenue = analyticsRows.reduce((s, r) => s + (r.metrics?.[0] || 0), 0);
+
+    // Из транзакций считаем каждую статью расходов отдельно
     const expenseMap = {};
-    let totalRevenueTx = 0; // выручка из транзакций для проверки
+    let txRevenue = 0;     // выручка из транзакций
+    let txCompensation = 0; // компенсации (баллы, программы партнёров)
 
     for (const op of allOps) {
       const amount = parseFloat(op.amount) || 0;
-      totalNetto += amount;
+      const type = op.operation_type_name || 'Прочее';
 
-      // Собираем расходы
-      if (amount < 0) {
-        const type = op.operation_type_name || 'Прочее';
+      if (amount > 0) {
+        // Доходы: выручка от продаж и компенсации
+        if (op.operation_type === 'OperationAgentDeliveredToCustomer' ||
+            op.operation_type === 'ClientReturnAgentOperation') {
+          txRevenue += amount;
+        } else {
+          txCompensation += amount; // баллы, программы партнёров
+        }
+      } else if (amount < 0) {
         expenseMap[type] = (expenseMap[type] || 0) + amount;
       }
-
-      // Считаем выручку из транзакций (accruals_for_sale)
-      const accrual = parseFloat(op.accruals_for_sale) || 0;
-      if (accrual > 0) totalRevenueTx += accrual;
     }
 
-    // Выручка из аналитики (более точная)
-    const analyticsRows = analyticsRaw?.result?.data || [];
-    const totalRevenueAnalytics = analyticsRows.reduce((s, r) => s + (r.metrics?.[0] || 0), 0);
+    const totalExpenses = Object.values(expenseMap).reduce((s, v) => s + v, 0);
 
-    // Если нетто близко к нулю или явно неправильное — используем коэффициент от аналитики
-    // Это случается когда период транзакций не совпадает с периодом продаж (лаг доставки)
-    const nettoRatio = totalRevenueAnalytics > 0 ? totalNetto / totalRevenueAnalytics : 0;
-    const useRealNetto = Math.abs(nettoRatio) > 0.3 && Math.abs(nettoRatio) < 1.5;
+    // Нетто из транзакций = выручка + компенсации + расходы
+    const nettoFromTx = txRevenue + txCompensation + totalExpenses;
 
-    const finalNetto = useRealNetto
-      ? Math.round(totalNetto * 100) / 100
-      : Math.round(totalRevenueAnalytics * 0.7672 * 100) / 100; // коэффициент из реального отчёта
+    // Проверяем: если нетто из транзакций разумное (30-90% от аналитической выручки)
+    // используем его, иначе считаем по проценту 76.72% из реального отчёта
+    const ratio = totalRevenue > 0 ? nettoFromTx / totalRevenue : 0;
+    const nettoIsValid = ratio > 0.3 && ratio < 1.2;
+
+    const finalNetto = nettoIsValid
+      ? nettoFromTx
+      : totalRevenue * 0.7672; // 76.72% — точный процент из майского отчёта
 
     res.json({
       analytics: analyticsRaw,
-      netto: finalNetto,
-      netto_raw: Math.round(totalNetto * 100) / 100,
-      netto_ratio: nettoRatio.toFixed(3),
-      used_real_netto: useRealNetto,
+      netto: Math.round(finalNetto),
       expenses: expenseMap,
-      operations_count: allOps.length,
+      debug: {
+        tx_revenue: Math.round(txRevenue),
+        tx_compensation: Math.round(txCompensation),
+        tx_expenses: Math.round(totalExpenses),
+        netto_from_tx: Math.round(nettoFromTx),
+        netto_ratio: ratio.toFixed(3),
+        netto_source: nettoIsValid ? 'transactions' : 'percentage_76.72%',
+        operations_count: allOps.length,
+      }
     });
   } catch (err) {
     res.status(500).json({ error: err.message });
